@@ -1,0 +1,140 @@
+from segment_anything import build_sam, SamPredictor
+import os
+import cv2
+import numpy as np
+from collections import defaultdict
+import time
+
+class Colors:
+    # Ultralytics color palette https://ultralytics.com/
+    def __init__(self):
+        # hex = matplotlib.colors.TABLEAU_COLORS.values()
+        hexs = ('FF3838', 'FF9D97', 'FF701F', 'FFB21D', 'CFD231', '48F90A', '92CC17', '3DDB86', '1A9334', '00D4BB',
+                '2C99A8', '00C2FF', '344593', '6473FF', '0018EC', '8438FF', '520085', 'CB38FF', 'FF95C8', 'FF37C7')
+        self.palette = [self.hex2rgb(f'#{c}') for c in hexs]
+        self.n = len(self.palette)
+
+    def __call__(self, i, bgr=False):
+        c = self.palette[int(i) % self.n]
+        return (c[2], c[1], c[0]) if bgr else c
+
+    @staticmethod
+    def hex2rgb(h):  # rgb order (PIL)
+        return tuple(int(h[1 + i:1 + i + 2], 16) for i in (0, 2, 4))
+
+
+colors = Colors()  # create instance for 'from utils.plots import colors'
+from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
+# predictor = SamPredictor(build_sam(checkpoint="checkpoint/sam_vit_b_01ec64.pth"))
+# _ = predictor.model.to(device='cuda')
+sam_checkpoint = "checkpoint/sam_vit_b_01ec64.pth"
+model_type = "vit_b"
+device = "cuda"
+sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+predictor = SamPredictor(sam)
+sam.to(device=device)
+# image = cv2.imread('/home/hadoop-vacv/yanfeng/data/dancetrack/train/dancetrack0001/img1/00000109.jpg')
+# image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+# predictor.set_image(image)
+
+# bbox = np.array([0,0,100,100], dtype=np.int32)
+
+# masks, _, _ = predictor.predict(box=bbox)
+
+# masks
+
+input_path = './img11'
+targets = [f for f in os.listdir(os.path.join(input_path, 'img1')) if
+           not os.path.isdir(os.path.join(input_path, 'img1', f))]
+targets = [os.path.join(input_path, 'img1', f) for f in targets]
+targets.sort()
+
+bboxes_all = defaultdict(list)
+gt_path = os.path.join(input_path, 'gt', 'gt.txt')
+#print(gt_path)
+# gt_path = os.path.join('/home/hadoop-vacv/yanfeng/project/MOTRv2/MOTRv3/exps/motrv2ch_uni5cost6g/run2/tracker0', 'dancetrack0004.txt')
+for l in open(gt_path):
+    t, i, *xywh, mark, label = l.strip().split(',')[:8]
+    #print(t,i,mark,label)
+    t, i, mark, label = map(int, (t, i, mark, label))
+    if mark == 0:
+        continue
+    if label in [3, 4, 5, 6, 9, 10, 11]:  # Non-person
+        continue
+    else:
+        crowd = False
+    x, y, w, h = map(int, map(float, (xywh)))
+    bboxes_all[t].append([x, y, x + w, y + h, i])
+
+
+fps = 25
+size = (1920, 1080)
+videowriter = cv2.VideoWriter('tmp.avi', cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'), fps, size)
+
+for t in targets:
+    print(f"Processing '{t}'...")
+    image = cv2.imread(t)
+    frame1 = t.split('\\')[-1]  # 这会得到 '113.jpg'
+    frame = frame1.split('.')[0]  # 这会得到 '113'
+    if image is None:
+        print(f"Could not load '{t}' as an image, skipping...")
+        continue
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+    masks_all = []
+    bboxes = np.array(bboxes_all[int(os.path.basename(t)[:-4])])
+    # predictor.set_image(image)
+    # masks, _, _ = predictor.predict(box=bboxes[:, :4])
+    predictor.set_image(image)
+    output_path = './img11/img11/'
+    for bbox in bboxes:
+        #print(bbox)
+        masks, iou_predictions, low_res_masks = predictor.predict(box=bbox[:4])
+        index_max = iou_predictions.argsort()[0]
+        masks = np.concatenate(
+            [masks[index_max:(index_max + 1)], masks[index_max:(index_max + 1)], masks[index_max:(index_max + 1)]],
+            axis=0)
+        masks1 = masks
+        if masks1.dtype != np.uint8:
+            masks1 = (masks1*255).astype(np.uint8)  # 乘以 255 并转换为 uint8
+            masks1 = 255 - masks1
+        # 保存掩膜图像
+        mask_image = masks1[index_max]  # 假设我们只对单一的掩膜图像感兴趣
+        mask_image1 = mask_image[int(bbox[1]):int(bbox[3]),int(bbox[0]):int(bbox[2])]
+        #print(mask_image1.shape)
+        #print('frame',frame)
+        folder_path = f'{output_path}{bbox[-1]}-{int(int(frame)/100)+1}/'
+        os.makedirs(folder_path, exist_ok=True)
+        cv2.imwrite(f"{folder_path}{frame}.jpg", mask_image1)
+        masks = masks.astype(np.int32) * np.array(colors(bbox[4]))[:, None, None]
+        #cv2.imwrite('{}.jpg'.format(bbox[-1]),masks)
+        masks_all.append(masks)
+    predictor.reset_image()
+
+    if len(masks_all):
+        masks_sum = masks_all[0].copy()
+        for m in masks_all[1:]:
+            masks_sum += m
+    else:
+        masks_sum = np.zeros_like(img).transpose(2, 0, 1)
+
+    img = image.copy()[..., ::-1]
+    img = (img * 0.5 + (masks_sum.transpose(1, 2, 0) * 30) % 128).astype(np.uint8)
+    for bbox in bboxes:
+        cv2.rectangle(img, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), (0, 0, 255), thickness=3)
+        i = int(bbox[-1])
+        text = 'id:'+ str(i)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(img, text, (int(bbox[0]), int(bbox[1])), font, 1, (0, 255, 0), 2)
+
+    cv2.imwrite(f"{output_path}{frame}.jpg", img)
+
+    videowriter.write(img)
+
+videowriter.release()
+
+
+
+
+
